@@ -226,9 +226,13 @@ def described_backend(monkeypatch):
             return self.stream
 
     sock = ConnectedSocket()
-    sock.stream = FakeSockFile(packet(b"PacketSize=20020;qXfer:features:read+")
-                              + packet(b"l" + target) + packet(b"l" + core)
-                              + packet(b"l" + system) + b"+")
+    sock.stream = FakeSockFile(
+        packet(b"PacketSize=20020;qXfer:features:read+")
+        + packet(b"l" + target)
+        + packet(b"l" + core)
+        + packet(b"l" + system)
+        + b"+"
+    )
     monkeypatch.setattr(socket, "socket", lambda *_args: sock)
     backend = GDBBackend()
     backend.open()
@@ -352,7 +356,7 @@ def test_new_connection_does_not_inherit_system_register_identities(monkeypatch,
         includes = b'<xi:include href="arm-m-profile.xml"/>'
         if feature_mode == "broken-system":
             includes += b'<xi:include href="arm-m-system.xml"/>'
-        target = b'<target xmlns:xi="http://www.w3.org/2001/XInclude">' + includes + b'</target>'
+        target = b'<target xmlns:xi="http://www.w3.org/2001/XInclude">' + includes + b"</target>"
         core = b'<feature><reg name="xpsr" bitsize="32" regnum="25"/></feature>'
         replies = packet(b"PacketSize=20020;qXfer:features:read+") + packet(b"l" + target) + packet(b"l" + core)
         replies += packet(b"l<feature") if feature_mode == "broken-system" else b"+"
@@ -373,3 +377,26 @@ def test_new_connection_does_not_inherit_system_register_identities(monkeypatch,
     with pytest.raises(GDBError, match="immediately after reset-and-halt"):
         backend.read_register("msp")
     assert bytes(sock.sent) == before, "missing MSP identity must fail before reading an old index"
+
+
+def test_raw_capture_connection_never_resumes_guest(monkeypatch):
+    class ConnectedSocket(FakeSocket):
+        def settimeout(self, _timeout):
+            pass
+
+        def setsockopt(self, *_args):
+            pass
+
+        def connect(self, _address):
+            pass
+
+        def makefile(self, *_args, **_kwargs):
+            return FakeSockFile(packet(b""))
+
+    sock = ConnectedSocket()
+    monkeypatch.setattr(socket, "socket", lambda *_args: sock)
+    backend = GDBBackend(resume_on_connect=False)
+    backend.open()
+    assert b"$c#" not in sock.sent
+    assert not backend._is_running
+    backend.close()

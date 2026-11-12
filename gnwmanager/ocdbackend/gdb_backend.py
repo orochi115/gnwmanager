@@ -23,11 +23,12 @@ _CORE_REGISTERS = {"sp": 13, "lr": 14, "pc": 15, "xpsr": 25}
 
 
 class GDBBackend(OCDBackend):
-    def __init__(self, host: str = "localhost", port: int = 1234):
+    def __init__(self, host: str = "localhost", port: int = 1234, resume_on_connect: bool = True):
         super().__init__()
         self.version = (0, 0, 0)
         self.host = host
         self.port = port
+        self.resume_on_connect = resume_on_connect
         self._socket = None
         self._sock_file = None
         self._is_running = False
@@ -70,7 +71,8 @@ class GDBBackend(OCDBackend):
             if b"qXfer:features:read+" in supported.split(b";"):
                 self._load_register_description()
             # QEMU halts on client connection; retain physical-probe behavior.
-            self.resume()
+            if self.resume_on_connect:
+                self.resume()
         except BaseException:
             self.close()
             raise
@@ -111,8 +113,7 @@ class GDBBackend(OCDBackend):
     def _load_register_description(self):
         """Read just the two features needed by this Cortex-M backend."""
         target = self._read_feature("target.xml")
-        features = [element.get("href") for element in target.iter()
-                    if element.tag.rsplit("}", 1)[-1] == "include"]
+        features = [element.get("href") for element in target.iter() if element.tag.rsplit("}", 1)[-1] == "include"]
         if "arm-m-profile.xml" not in features:
             raise GDBError("GDB backend requires an ARM M-profile target")
         for name in ("arm-m-profile.xml", "arm-m-system.xml"):

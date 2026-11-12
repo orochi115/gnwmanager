@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import sys
 import traceback
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal, Optional
@@ -174,7 +174,11 @@ def upgrade():
     old_version = __version__
     subprocess.check_output([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
     subprocess.check_output([sys.executable, "-m", "pip", "install", "--upgrade", "gnwmanager"])
-    res = subprocess.run([sys.executable, "-m", "gnwmanager", "--version"], stdout=subprocess.PIPE, check=True)
+    res = subprocess.run(
+        [sys.executable, "-m", "gnwmanager", "--version"],
+        stdout=subprocess.PIPE,
+        check=True,
+    )
     new_version = res.stdout.decode().strip()
     if old_version == new_version:
         print(f"GnWManager up-to-date (v{new_version}).")
@@ -208,7 +212,8 @@ def main(
     gdb_port: Annotated[int, Parameter(name=["--gdb-port"])] = 1234,
     frequency: Annotated[Optional[int], Parameter(name=["--frequency", "-f"], converter=int_parser)] = None,
     verbosity: Annotated[
-        Literal["debug", "info", "warning", "error"], Parameter(env_var="GNWMANAGER_VERBOSITY")
+        Literal["debug", "info", "warning", "error"],
+        Parameter(env_var="GNWMANAGER_VERBOSITY"),
     ] = "warning",
     gnw: Optional[GnWType] = None,
     exit_on_error: Annotated[bool, Parameter(parse=False)] = True,
@@ -244,10 +249,33 @@ def main(
 
             if "backend_factory" in ignored:
 
-                def server_options():
+                def server_options(_command=command, _gnw=gnw):
                     backend_kwargs = {"host": gdb_host, "port": gdb_port} if backend == "gdb" else {}
+                    backup_command = _command.__name__ in (
+                        "backup",
+                        "restore_backup_command",
+                    )
+                    if backend == "gdb" and backup_command:
+                        backend_kwargs["resume_on_connect"] = False
+                    borrowed = _gnw.backend if backup_command and _gnw is not None else None
+
+                    @contextmanager
+                    def borrow_backend():
+                        # Invalidate only after validation/confirmation actually
+                        # enters the device context. No reset/resume occurs here,
+                        # and caller-owned connections stay open even on error.
+                        try:
+                            yield borrowed
+                        finally:
+                            _gnw.invalidate_manager_state()
+
                     return {
-                        "factory": lambda: OCDBackend[backend](**backend_kwargs),
+                        # A previous command or injected shell already owns an
+                        # open device. Borrow without __enter__/open or close;
+                        # the main caller retains its existing lifetime policy.
+                        "factory": (
+                            borrow_backend if borrowed is not None else lambda: OCDBackend[backend](**backend_kwargs)
+                        ),
                         "frequency": frequency,
                         "backend_name": backend,
                     }

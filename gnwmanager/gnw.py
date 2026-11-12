@@ -429,6 +429,18 @@ class GnW:
         self._in_flight_retry = [None, None]
         log.debug(f"context_counter reset to {self.context_counter}.")
 
+    def invalidate_manager_state(self):
+        """Forget host state after another operation uses this device connection.
+
+        This performs no device I/O. The next manager-dependent command loads
+        fresh firmware rather than trusting execution or communication caches
+        retained before an independently managed backup/restore operation.
+        """
+        self._gnwmanager_started = False
+        self.reset_context_counter()
+        self._external_flash_size = 0
+        self._external_flash_block_size = 0
+
     def reset(self):
         log.debug("Performing device reset.")
         self.backend.reset()

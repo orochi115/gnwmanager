@@ -1,3 +1,4 @@
+from gnwmanager.cli._backup import backup, fetch_backup_command, restore_backup_command, verify_backup
 from gnwmanager.cli._bootloader import flash_bootloader
 from gnwmanager.cli._debug import debug
 from gnwmanager.cli._dump import dump
