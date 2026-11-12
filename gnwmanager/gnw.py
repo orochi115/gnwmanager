@@ -15,7 +15,7 @@ from gnwmanager.ocdbackend import OCDBackend
 from gnwmanager.status import flashapp_status_enum_to_str
 from gnwmanager.time import timestamp_now
 from gnwmanager.utils import EMPTY_HASH_DIGEST, chunk_bytes, compress_lzma, pad_bytes, sha256
-from gnwmanager.validation import validate_extflash_offset, validate_intflash_offset
+from gnwmanager.validation import validate_extflash_offset, validate_intflash_offset, validate_flash_range
 
 log = logging.getLogger(__name__)
 
@@ -536,6 +536,9 @@ class GnW:
             List of 32-byte sha256 hashes.
         """
         validate_extflash_offset(offset)
+        if size <= 0:
+            raise ValueError("Hash size must be >0.")
+        validate_flash_range(offset, size, self.external_flash_size)
         n_chunks = int(ceil(size / (256 << 10)))
         log.debug(f"Hashing {size} bytes starting at {offset} in {n_chunks}x 256KB chunks.")
 
@@ -597,8 +600,14 @@ class GnW:
 
         if bank == 0:
             validate_extflash_offset(offset)
+            capacity, block = self.external_flash_size, self.external_flash_block_size
         else:
             validate_intflash_offset(offset)
+            capacity, block = 256 << 10, 8192
+
+        validate_flash_range(offset, len(data), capacity, erase_block=block if erase else 1)
+        if bank != 0 and len(data) % block:
+            raise ValueError("Internal program size must be a multiple of 8192.")
 
         if not data:
             return
@@ -671,15 +680,19 @@ class GnW:
         """High level convenience function for flashing any-length data to any flash location."""
         op_name = f"flash bank={bank} offset=0x{offset:x}"
         if bank == 0:
+            validate_extflash_offset(offset)
             data = pad_bytes(data, self.external_flash_block_size)
-            if len(data) > self.external_flash_size:
-                raise ValueError("Data cannot fit into external flash.")
+            validate_flash_range(offset, len(data), self.external_flash_size)
+            if not data:
+                return
 
             self._with_transfer_retry(op_name, self._flash_ext, offset, data, progress=progress, desc=desc)
         elif bank in (1, 2):
+            validate_intflash_offset(offset)
             data = pad_bytes(data, 8192)
-            if len(data) > (256 << 10):
-                raise ValueError("Data cannot fit into internal flash.")
+            validate_flash_range(offset, len(data), 256 << 10)
+            if not data:
+                return
 
             self._with_transfer_retry(op_name, self.program, bank, offset, data)
         else:
@@ -733,10 +746,16 @@ class GnW:
 
         if bank == 0:
             validate_extflash_offset(offset)
+            capacity, block = self.external_flash_size, self.external_flash_block_size
         elif bank in (1, 2):
             validate_intflash_offset(offset)
+            capacity, block = 256 << 10, 8192
         else:
             raise NotImplementedError
+
+        validate_flash_range(offset, size, capacity, erase_block=block)
+        if not whole_chip:
+            size = _round_up(size, block)
 
         # Perform action
         context = self.get_context()
