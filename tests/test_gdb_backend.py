@@ -5,8 +5,8 @@ import pytest
 from gnwmanager.ocdbackend.gdb_backend import GDBBackend, GDBError, _checksum
 
 
-class FakeSockFile:
-    """Stands in for the socket's buffered file object."""
+class FakeRecvStream:
+    """Byte stream for the direct socket recv test seam."""
 
     def __init__(self, data: bytes, raise_timeout: bool = False):
         self.data = data
@@ -28,6 +28,12 @@ class FakeSocket:
     def __init__(self):
         self.sent = bytearray()
 
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def recv(self, n):
+        return self.stream.read(n)
+
     def sendall(self, data: bytes):
         self.sent.extend(data)
 
@@ -38,7 +44,7 @@ class FakeSocket:
 def make_backend(reply_stream: bytes, raise_timeout: bool = False) -> GDBBackend:
     backend = GDBBackend()
     backend._socket = FakeSocket()
-    backend._sock_file = FakeSockFile(reply_stream, raise_timeout=raise_timeout)
+    backend._socket.stream = FakeRecvStream(reply_stream, raise_timeout=raise_timeout)
     return backend
 
 
@@ -222,11 +228,8 @@ def described_backend(monkeypatch):
         def connect(self, _address):
             pass
 
-        def makefile(self, *_args, **_kwargs):
-            return self.stream
-
     sock = ConnectedSocket()
-    sock.stream = FakeSockFile(
+    sock.stream = FakeRecvStream(
         packet(b"PacketSize=20020;qXfer:features:read+")
         + packet(b"l" + target)
         + packet(b"l" + core)
@@ -242,7 +245,7 @@ def described_backend(monkeypatch):
 
 def test_msp_read_uses_target_description_not_active_sp(monkeypatch):
     backend = described_backend(monkeypatch)
-    backend._sock_file = FakeSockFile(packet(b"00000120"))
+    backend._socket.stream = FakeRecvStream(packet(b"00000120"))
     assert backend.read_register("msp") == 0x20010000
     assert b"xmlRegisters=arm" in backend._socket.sent
     assert b"$p2b#" in backend._socket.sent
@@ -251,7 +254,7 @@ def test_msp_read_uses_target_description_not_active_sp(monkeypatch):
 def test_inactive_msp_write_is_rejected_without_changing_active_psp(monkeypatch):
     backend = described_backend(monkeypatch)
     # CONTROL.SPSEL selects PSP in Thread mode (IPSR=0 in XPSR).
-    backend._sock_file = FakeSockFile(packet(b"02000000") + packet(b"00000001") + packet(b"OK"))
+    backend._socket.stream = FakeRecvStream(packet(b"02000000") + packet(b"00000001") + packet(b"OK"))
     with pytest.raises(GDBError, match="inactive MSP"):
         backend.write_register("msp", 0x2000F000)
     assert b"$Pd=" not in backend._socket.sent
@@ -260,7 +263,7 @@ def test_inactive_msp_write_is_rejected_without_changing_active_psp(monkeypatch)
 
 def test_active_msp_write_uses_writable_core_stack_pointer(monkeypatch):
     backend = described_backend(monkeypatch)
-    backend._sock_file = FakeSockFile(packet(b"00000000") + packet(b"OK"))
+    backend._socket.stream = FakeRecvStream(packet(b"00000000") + packet(b"OK"))
     backend.write_register("msp", 0x2000F000)
     assert b"$Pd=00f00020#" in backend._socket.sent
     assert b"$P2b=" not in backend._socket.sent
@@ -279,12 +282,12 @@ def test_continuing_ack_noise_cannot_extend_command_deadline(monkeypatch):
     backend = make_backend(b"!" * 20)
     with pytest.raises(GDBError, match="Timed out.*command"):
         backend.read_memory(0x20000000, 4)
-    assert backend._sock_file.pos < 20
+    assert backend._receive_buffer, "deadline must stop parsing the continuing noise"
 
 
 def test_handler_mode_can_write_selected_msp_despite_thread_spsel(monkeypatch):
     backend = described_backend(monkeypatch)
-    backend._sock_file = FakeSockFile(packet(b"02000000") + packet(b"10000001") + packet(b"OK"))
+    backend._socket.stream = FakeRecvStream(packet(b"02000000") + packet(b"10000001") + packet(b"OK"))
     backend.write_register("msp", 0x2000F000)
     assert b"$Pd=00f00020#" in backend._socket.sent
 
@@ -316,10 +319,8 @@ def test_corrupt_handshake_does_not_continue_target(monkeypatch):
         def connect(self, _address):
             pass
 
-        def makefile(self, *_args, **_kwargs):
-            return FakeSockFile(b"+$PacketSize=20020#00+")
-
     sock = ConnectedSocket()
+    sock.stream = FakeRecvStream(b"+$PacketSize=20020#00+")
     monkeypatch.setattr(socket, "socket", lambda *_args: sock)
     backend = GDBBackend()
     with pytest.raises(GDBError, match="checksum"):
@@ -346,9 +347,6 @@ def test_new_connection_does_not_inherit_system_register_identities(monkeypatch,
         def connect(self, _address):
             pass
 
-        def makefile(self, *_args, **_kwargs):
-            return self.stream
-
     sock = ConnectedSocket()
     if feature_mode == "no-xml":
         replies = packet(b"PacketSize=20020") + b"+"
@@ -360,7 +358,7 @@ def test_new_connection_does_not_inherit_system_register_identities(monkeypatch,
         core = b'<feature><reg name="xpsr" bitsize="32" regnum="25"/></feature>'
         replies = packet(b"PacketSize=20020;qXfer:features:read+") + packet(b"l" + target) + packet(b"l" + core)
         replies += packet(b"l<feature") if feature_mode == "broken-system" else b"+"
-    sock.stream = FakeSockFile(replies)
+    sock.stream = FakeRecvStream(replies)
     monkeypatch.setattr(socket, "socket", lambda *_args: sock)
     if feature_mode == "broken-system":
         with pytest.raises(GDBError, match="Malformed target description XML"):
@@ -390,13 +388,176 @@ def test_raw_capture_connection_never_resumes_guest(monkeypatch):
         def connect(self, _address):
             pass
 
-        def makefile(self, *_args, **_kwargs):
-            return FakeSockFile(packet(b""))
-
     sock = ConnectedSocket()
+    sock.stream = FakeRecvStream(packet(b""))
     monkeypatch.setattr(socket, "socket", lambda *_args: sock)
     backend = GDBBackend(resume_on_connect=False)
     backend.open()
     assert b"$c#" not in sock.sent
     assert not backend._is_running
     backend.close()
+
+
+def test_real_fragmented_checksum_cannot_outlive_total_deadline():
+    import threading
+    import time
+
+    reader, writer = socket.socketpair()
+    reader.settimeout(1)
+    backend = GDBBackend()
+    backend._socket = reader
+    backend._deadline = time.monotonic() + 0.12
+    stop = threading.Event()
+
+    def fragments():
+        for byte in (b"a", b"b"):
+            if stop.wait(0.08):
+                return
+            try:
+                writer.sendall(byte)
+            except OSError:
+                return
+
+    worker = threading.Thread(target=fragments)
+    worker.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(GDBError, match="Timed out"):
+            backend._read(2)
+        assert time.monotonic() - started < 0.2
+    finally:
+        stop.set()
+        backend.close()
+        writer.close()
+        worker.join(1)
+        assert not worker.is_alive()
+
+
+@pytest.fixture
+def short_socket_dir():
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    with TemporaryDirectory(prefix="gnw-gdb-", dir="/tmp") as directory:
+        yield Path(directory)
+
+
+def test_unix_default_stays_halted_and_never_sets_tcp_nodelay(short_socket_dir):
+    import threading
+
+    path = short_socket_dir / "g.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    listener.listen(1)
+    listener.settimeout(1)
+    commands = []
+    errors = []
+
+    def stub():
+        try:
+            peer, _ = listener.accept()
+            with peer:
+                peer.settimeout(1)
+                request = bytearray()
+                while b"#" not in request or len(request.rsplit(b"#", 1)[-1]) < 2:
+                    request.extend(peer.recv(4096))
+                commands.append(bytes(request))
+                peer.sendall(packet(b""))
+                while True:
+                    data = peer.recv(4096)
+                    if not data:
+                        break
+                    commands.append(data)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=stub)
+    worker.start()
+    backend = None
+    try:
+        backend = GDBBackend(unix_socket=path)
+        backend.open()
+        assert not backend._is_running
+        assert backend.resume_on_connect is False
+        assert backend._socket.family == socket.AF_UNIX
+    finally:
+        if backend:
+            backend.close()
+        listener.close()
+        worker.join(2)
+        assert not worker.is_alive()
+    assert not errors
+    assert commands and b"qSupported" in commands[0]
+    assert b"$c#" not in b"".join(commands)
+
+
+def test_tcp_default_still_resumes_and_sets_nodelay(monkeypatch):
+    class ConnectedSocket(FakeSocket):
+        def __init__(self):
+            super().__init__()
+            self.options = []
+            self.address = None
+            self.stream = FakeRecvStream(packet(b"") + b"+")
+
+        def settimeout(self, _timeout):
+            pass
+
+        def setsockopt(self, *args):
+            self.options.append(args)
+
+        def connect(self, address):
+            self.address = address
+
+    peer = ConnectedSocket()
+    monkeypatch.setattr(socket, "socket", lambda *_args: peer)
+    backend = GDBBackend(host="127.0.0.1", port=1234)
+    backend.open()
+    assert peer.address == ("127.0.0.1", 1234)
+    assert (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) in peer.options
+    assert backend.resume_on_connect is True
+    assert backend._is_running
+    assert b"$c#" in peer.sent
+    backend.close()
+
+
+def test_real_command_deadline_bounds_checksum_fragment_recv():
+    import threading
+    import time
+
+    reader, writer = socket.socketpair()
+    reader.settimeout(5)
+    writer.settimeout(1)
+    backend = GDBBackend()
+    backend._socket = reader
+    stop = threading.Event()
+    errors = []
+
+    def stub():
+        try:
+            writer.recv(4096)
+            writer.sendall(b"+$00#")
+            if stop.wait(4.8):
+                return
+            writer.sendall(b"6")
+            if stop.wait(0.7):
+                return
+            writer.sendall(b"0")
+        except OSError:
+            pass
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=stub)
+    worker.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(GDBError, match="Timed out"):
+            backend.read_memory(0x20000000, 1)
+        assert 4.7 < time.monotonic() - started < 5.3
+    finally:
+        stop.set()
+        backend.close()
+        writer.close()
+        worker.join(1)
+        assert not worker.is_alive()
+        assert not errors

@@ -1,6 +1,8 @@
 import contextlib
 import socket
+from pathlib import Path
 from time import monotonic
+from typing import Optional, Union
 from xml.etree import ElementTree
 
 from gnwmanager.exceptions import DebugProbeConnectionError
@@ -23,14 +25,23 @@ _CORE_REGISTERS = {"sp": 13, "lr": 14, "pc": 15, "xpsr": 25}
 
 
 class GDBBackend(OCDBackend):
-    def __init__(self, host: str = "localhost", port: int = 1234, resume_on_connect: bool = True):
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 1234,
+        resume_on_connect: Optional[bool] = None,
+        *,
+        unix_socket: Optional[Union[Path, str]] = None,
+    ):
         super().__init__()
         self.version = (0, 0, 0)
         self.host = host
         self.port = port
-        self.resume_on_connect = resume_on_connect
+        self.unix_socket = Path(unix_socket) if unix_socket is not None else None
+        self.resume_on_connect = unix_socket is None if resume_on_connect is None else resume_on_connect
         self._socket = None
-        self._sock_file = None
+        self._receive_buffer = bytearray()
+        self._receive_position = 0
         self._is_running = False
         self._deadline = None
         # ARM M-profile core numbering, including the legacy FPA gap. MSP is
@@ -42,25 +53,21 @@ class GDBBackend(OCDBackend):
         # A new peer must never inherit the previous target's system indices,
         # including when the last description was only partially received.
         self.close()
-        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._socket.settimeout(5.0)
-        # The GDB remote protocol here is dominated by tiny packets waiting
-        # on each other's replies (a single-byte '+' ack, a short "m<addr>,4"
-        # read). Without this, Nagle's algorithm on this socket combines with
-        # the peer's delayed-ACK timer to add a fixed ~40ms stall to every
-        # single request/response round trip -- measured directly against
-        # qemu-gnw's gdbstub (a `gnwmanager --backend gdb info` call went from ~6.7s,
-        # matching real hardware over OpenOCD, to ~39s with this unset).
-        self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        address = str(self.unix_socket) if self.unix_socket is not None else (self.host, self.port)
         try:
-            self._socket.connect((self.host, self.port))
-            self._sock_file = self._socket.makefile("rb", buffering=8192)
-        except OSError as e:
+            self._socket = socket.socket(
+                socket.AF_UNIX if self.unix_socket is not None else socket.AF_INET,
+                socket.SOCK_STREAM,
+            )
+            self._socket.settimeout(5.0)
+            # TCP_NODELAY prevents tiny RSP packets from waiting for delayed ACKs.
+            # AF_UNIX has no TCP options and managed sessions stay halted by default.
+            if self.unix_socket is None:
+                self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self._socket.connect(address)
+        except OSError as error:
             self.close()
-            raise DebugProbeConnectionError(
-                f"Could not connect to QEMU GDB server at {self.host}:{self.port}. "
-                f"Is QEMU running with '-gdb tcp::{self.port}'?"
-            ) from e
+            raise DebugProbeConnectionError(f"Could not connect to QEMU GDB server at {address}.") from error
 
         try:
             # Some simple stubs do not support XML. Their MSP alias can only
@@ -81,16 +88,15 @@ class GDBBackend(OCDBackend):
 
     def close(self):
         if self._socket:
-            if hasattr(self, "_sock_file") and self._sock_file:
-                self._sock_file.close()
             with contextlib.suppress(OSError):
                 self._socket.close()
             self._socket = None
         self._is_running = False
         self._msp_alias_safe = False
         self._deadline = None
+        self._receive_buffer.clear()
+        self._receive_position = 0
         self._registers = dict(_CORE_REGISTERS)
-        self._sock_file = None
 
     def _read_feature(self, name):
         data = bytearray()
@@ -103,7 +109,11 @@ class GDBBackend(OCDBackend):
                 # QEMU's generated target.xml omits the namespace declaration
                 # understood implicitly by GDB's target-description reader.
                 if name == "target.xml" and b"xmlns:xi=" not in data:
-                    data = data.replace(b"<target>", b'<target xmlns:xi="http://www.w3.org/2001/XInclude">', 1)
+                    data = data.replace(
+                        b"<target>",
+                        b'<target xmlns:xi="http://www.w3.org/2001/XInclude">',
+                        1,
+                    )
                 try:
                     return ElementTree.fromstring(data)
                 except ElementTree.ParseError as error:
@@ -131,32 +141,46 @@ class GDBBackend(OCDBackend):
                 self._registers[register.get("name")] = number
                 number += 1
 
-    def _read(self, n: int) -> bytes:
-        """Read exactly ``n`` bytes, translating socket failures into GDBError.
+    def _set_remaining_timeout(self):
+        if not self._socket:
+            raise GDBError("Socket is not open")
+        remaining = 5.0 if self._deadline is None else self._deadline - monotonic()
+        if remaining <= 0:
+            raise GDBError("Timed out waiting for the GDB command to complete")
+        self._socket.settimeout(remaining)
 
-        The socket carries a 5s timeout (see open()); without this translation a
-        raw socket.timeout would escape past TransferErrors' retry machinery and
-        main.py's DebugProbeConnectionError handling.
+    def _read(self, n: int) -> bytes:
+        """Receive exactly n bytes within the existing total command deadline.
+
+        A small explicit buffer avoids a syscall for each RSP hex digit; unlike
+        makefile.read(n), each real recv is bounded by the remaining total time.
         """
         if self._deadline is not None and monotonic() >= self._deadline:
             raise GDBError("Timed out waiting for the GDB command to complete")
-        try:
-            data = self._sock_file.read(n)
-        except socket.timeout as e:
-            raise GDBError(f"Timed out waiting for {n} byte(s) from the GDB stub") from e
-        except OSError as e:
-            raise GDBError(f"Socket error while reading from the GDB stub: {e}") from e
-        if not data:
-            raise GDBError("Connection closed by remote")
-        if len(data) != n:
-            raise GDBError(f"Short packet read: expected {n} byte(s), got {len(data)}")
-        return data
+        while len(self._receive_buffer) - self._receive_position < n:
+            # Compact only when a real recv is needed, not for every hex digit.
+            del self._receive_buffer[: self._receive_position]
+            self._receive_position = 0
+            try:
+                self._set_remaining_timeout()
+                chunk = self._socket.recv(max(8192, n - len(self._receive_buffer)))
+            except socket.timeout as error:
+                raise GDBError(f"Timed out waiting for {n} byte(s) from the GDB stub") from error
+            except OSError as error:
+                raise GDBError(f"Socket error while reading from the GDB stub: {error}") from error
+            if not chunk:
+                raise GDBError("Connection closed by remote")
+            self._receive_buffer.extend(chunk)
+        start = self._receive_position
+        self._receive_position += n
+        return bytes(self._receive_buffer[start : self._receive_position])
 
     def _write(self, data: bytes):
         """Send all of ``data``, translating socket failures into GDBError."""
         if not self._socket:
             raise GDBError("Socket is not open")
         try:
+            self._set_remaining_timeout()
             self._socket.sendall(data)
         except socket.timeout as e:
             raise GDBError("Timed out sending to the GDB stub") from e
