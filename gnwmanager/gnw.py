@@ -1050,7 +1050,7 @@ class GnW:
         self.write_uint32(context["ready"], 0)
         self.wait_for_idle()
         if (status_enum & ERROR_MASK) == 0xBAD0_0000 and status_enum != 0xBAD0000C:
-            self._get_status()
+            raise DataError(flashapp_status_enum_to_str.get(status_enum, "UNKNOWN"))
         if status_enum == 0xBAD0000C:
             log.warning("SD directory listing was truncated (output larger than 256 KiB).")
         return data.decode("utf-8", errors="replace")

@@ -472,6 +472,26 @@ DSTATUS USER_SOFTSPI_status(
 /* Read sector(s)                                                        */
 /*-----------------------------------------------------------------------*/
 
+/* Every block has its own optional wait bytes, data token and two-byte CRC.
+ * A fixed discard count consumes data whenever the next token arrives early. */
+static bool receive_read_block(BYTE *buff)
+{
+    uint8_t token;
+    timer_on(1, 500);
+    do
+    {
+        wdog_refresh();
+        SoftSpi_WriteDummyRead(sd.spi, &token, 1);
+    } while (token == 0xFF && timer_status(1));
+
+    if (token != START_BLOCK_TOKEN)
+        return false;
+
+    SoftSpi_WriteDummyRead(sd.spi, buff, BLOCK_SIZE);
+    finish_read_cmd();
+    return true;
+}
+
 DRESULT USER_SOFTSPI_read(
     BYTE pdrv,    /* Physical drive number (0) */
     BYTE *buff,   /* Pointer to the data buffer to store read data */
@@ -479,7 +499,9 @@ DRESULT USER_SOFTSPI_read(
     UINT count    /* Number of sectors to read (1..128) */
 )
 {
-    uint8_t ret;
+    bool multiple = count > 1;
+    bool started = false;
+    DRESULT result = RES_ERROR;
     /* pdrv should be 0 */
     if (pdrv || !count)
         return RES_PARERR;
@@ -496,55 +518,29 @@ DRESULT USER_SOFTSPI_read(
 
     SELECT();
 
-    if (count == 1)
+    if (send_cmd(multiple ? READ_MULTIPLE_BLOCK : READ_SINGLE_BLOCK, sector).r0)
+        goto cleanup;
+
+    started = true;
+    do
     {
-        /* READ_SINGLE_BLOCK */
-        if (send_cmd(READ_SINGLE_BLOCK, sector).r0)
-        {
-            return RES_ERROR;
-        }
+        if (!receive_read_block(buff))
+            goto cleanup;
+        buff += BLOCK_SIZE;
+    } while (--count);
+    result = RES_OK;
 
-        // We would fail on watchdog if something is wrong here
-        do
-        {
-            SoftSpi_WriteDummyRead(sd.spi, &ret, 1);
-        } while (ret != START_BLOCK_TOKEN); // Fix : add timeout
-
-        SoftSpi_WriteDummyRead(sd.spi, buff, BLOCK_SIZE);
-
-        finish_read_cmd();
-        count = 0;
-    }
-    else
-    {
-        if (send_cmd(READ_MULTIPLE_BLOCK, sector).r0)
-        {
-            return RES_ERROR;
-        }
-        // We would fail on watchdog if something is wrong here
-        do
-        {
-            SoftSpi_WriteDummyRead(sd.spi, &ret, 1);
-        } while (ret != START_BLOCK_TOKEN);
-
-        do
-        {
-            SoftSpi_WriteDummyRead(sd.spi, buff, BLOCK_SIZE);
-            /* discard CRC */
-            SoftSpi_WriteDummyRead(sd.spi, NULL, 10);
-            buff += 512;
-        } while (--count);
-
-        /* STOP_TRANSMISSION */
-        send_cmd(SEND_STOP_TRANSMISSION, 0);
-    }
+cleanup:
+    /* Stop even after a token/timeout error so the next command can recover. */
+    if (multiple && started && send_cmd(SEND_STOP_TRANSMISSION, 0).r0)
+        result = RES_ERROR;
 
     /* Idle */
     DESELECT();
     SD_ReadyWait();
     switch_ospi_gpio(true);
 
-    return count ? RES_ERROR : RES_OK;
+    return result;
 }
 
 /*-----------------------------------------------------------------------*/
