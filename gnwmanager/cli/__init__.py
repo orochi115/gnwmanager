@@ -22,5 +22,6 @@ from gnwmanager.cli._push import push
 from gnwmanager.cli._screenshot import screenshot
 from gnwmanager.cli._sdcard import sdls, sdpull, sdpush, sdrm
 from gnwmanager.cli._serve import serve
+from gnwmanager.cli._sessions import device_state, power, press, sessions
 from gnwmanager.cli._start import start
 from gnwmanager.cli._unlock import unlock

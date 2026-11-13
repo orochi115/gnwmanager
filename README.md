@@ -18,6 +18,62 @@ and other device administrative tasks.
 GnWManager accomplishes this via a small bundled pre-compiled firmware that gets
 executed from the STM32's RAM.
 
+## Desktop gwemu sessions (this fork)
+
+The default backend is `auto`: commands manage the gwemu ROM currently loaded
+in gnw-emu. Start the desktop UI and load a ROM first. `sessions` lists reachable
+sessions without taking ownership; when several are open, select the exact UUID
+with `--session`. A missing or busy session produces an error; auto never connects
+to a physical probe as a fallback.
+
+```sh
+gnwmanager sessions
+gnwmanager --session UUID info
+gnwmanager device-state
+gnwmanager power pause -- press 0x10 --duration-ms 100 -- device-state
+gnwmanager power usb-power true
+gnwmanager power battery-present false
+gnwmanager power battery 50
+gnwmanager power warm-reset
+gnwmanager power cold-start
+```
+
+`press` uses the desktop mask: left/up/right/down bits 0–3, A/B/TIME/GAME
+bits 4–7, PAUSE/POWER/START/SELECT bits 8–11. Supply booleans are `true` or
+`false`. These commands use the desktop's constrained machine-control interface.
+
+A single invocation, including commands separated by `--` and an interactive
+`shell`, owns one session until it exits. The fixed lease lasts at most five
+minutes; heartbeats keep idle work alive without extending that deadline.
+Normal completion restores the application's execution state. Manager upload
+or debug mutations require an application reset before restoration. Interrupted
+or uncertain work leaves the session paused and marked unknown; close/reopen it
+in the UI to recover. A ROM change never redirects an existing connection.
+
+`backup --skip-ext` captures original banks/extras without loading manager
+firmware. `verify-backup`, `fetch-backup`, and archive validation before restore
+are offline and do not discover or acquire a device. Session unlock/lock use
+cold-start and verify the protection latch; unlock waits for the existing blue
+payload and a hash-verified SRAM backup without requesting another POWER pulse.
+
+`gdb` runs the executable from `GDB` (default `arm-none-eabi-gdb`) against the
+lease-owned Unix proxy. ELF is optional in session mode. `gdbserver` prints a
+`target remote /path/socket` command and keeps that proxy leased until interrupted.
+Only one debugger can connect, and the endpoint expires with the lease. Session
+mode does not support `--port`; it never publishes the native GDB endpoint.
+Desktop discovery requires POSIX Unix sockets and is unavailable on Windows.
+
+Physical and standalone TCP backends remain explicit:
+
+```sh
+gnwmanager --backend openocd info
+gnwmanager --backend pyocd info
+gnwmanager --backend gdb --gdb-host localhost --gdb-port 1234 info
+```
+
+Use the explicit physical backend with the upstream hardware tutorials below.
+Software/emulator checks do not establish real-device compatibility.
+
 ## Features
 
 * Simple installation.

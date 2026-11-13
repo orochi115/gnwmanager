@@ -1071,6 +1071,9 @@ class GnW:
         if not force and self._gnwmanager_started:
             return
 
+        before_upload = getattr(self.backend, "before_manager_upload", None)
+        if before_upload is not None:
+            before_upload()
         self.reset_and_halt()
 
         firmware = (importlib.resources.files("gnwmanager") / "firmware.bin").read_bytes()

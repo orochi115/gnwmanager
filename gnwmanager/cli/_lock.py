@@ -62,8 +62,12 @@ def lock(
     gnw.start_gnwmanager()
 
     if gnw.is_locked():
-        print("Device already locked. Skipping. Completely power cycle your device.")
-        gnw.backend.reset()
+        if hasattr(gnw.backend, "session_lease"):
+            gnw.backend.cold_reconnect(expected_rdp=0x55)
+            print("Device already locked; cold-start protection verified.")
+        else:
+            print("Device already locked. Skipping. Completely power cycle your device.")
+            gnw.backend.reset()
         return
 
     if interactive:
@@ -79,6 +83,9 @@ def lock(
     gnw.write_memory(0x52002018, b"\x02")
     sleep(0.1)
 
-    gnw.backend.reset()
-
-    print("Locking complete! Completely power cycle your device (remove battery & usb power).")
+    if hasattr(gnw.backend, "session_lease"):
+        gnw.backend.cold_reconnect(expected_rdp=0x55)
+        print("Locking complete; cold-start protection verified.")
+    else:
+        gnw.backend.reset()
+        print("Locking complete! Completely power cycle your device (remove battery & usb power).")

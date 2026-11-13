@@ -17,9 +17,11 @@ from littlefs.errors import LittleFSError
 from gnwmanager import __version__
 from gnwmanager.cli._parsers import GnWType, OffsetType, int_parser
 from gnwmanager.cli.devices import AutodetectError, DeviceModel
+from gnwmanager.cli.session_route import SessionRoute
 from gnwmanager.exceptions import DataError, DebugProbeConnectionError
 from gnwmanager.gnw import GnW
 from gnwmanager.ocdbackend import OCDBackend
+from gnwmanager.session_client import SessionError
 
 with suppress(ImportError):
     # By importing, makes things like the arrow-keys work.
@@ -204,10 +206,19 @@ def _setup_logging(verbosity):
     logger.addHandler(handler)
 
 
+def _require_session(owner):
+    if owner is None:
+        raise SessionError("UNSUPPORTED", "Desktop control commands require --backend auto or session")
+    return owner
+
+
 @app.meta.default
 def main(
     *tokens: Annotated[str, Parameter(show=False, allow_leading_hyphen=True)],
-    backend: Annotated[Literal["openocd", "pyocd", "gdb"], Parameter(name=["--backend", "-b"])] = "openocd",
+    backend: Annotated[
+        Literal["auto", "session", "openocd", "pyocd", "gdb"], Parameter(name=["--backend", "-b"])
+    ] = "auto",
+    session: Annotated[Optional[str], Parameter(name="--session")] = None,
     gdb_host: Annotated[str, Parameter(name=["--gdb-host"])] = "localhost",
     gdb_port: Annotated[int, Parameter(name=["--gdb-port"])] = 1234,
     frequency: Annotated[Optional[int], Parameter(name=["--frequency", "-f"], converter=int_parser)] = None,
@@ -223,7 +234,7 @@ def main(
     Parameters
     ----------
     backend
-        Underlying on-chip-debugger backend to use. Use "gdb" to connect to a QEMU instance's gdbstub.
+        Defaults to the active desktop session. Explicit openocd/pyocd/gdb select standalone probes.
     gdb_host
         Host to connect to when using the "gdb" backend.
     gdb_port
@@ -237,6 +248,10 @@ def main(
     groups = [list(group) for key, group in itertools.groupby(tokens, lambda x: x == delimiter) if not key] or [[]]
 
     close_on_exit = gnw is None
+    owner = getattr(getattr(gnw, "backend", None), "session_owner", None)
+    owns_session = owner is None and gnw is None and backend in ("auto", "session")
+    if owns_session:
+        owner = SessionRoute(session_id=session)
     try:
         for group in groups:
             additional_kwargs = {}
@@ -247,7 +262,16 @@ def main(
                 # to connect to debug probe and device.
                 _display_host_info(backend)
 
-            if "backend_factory" in ignored:
+            if "session_route" in ignored:
+                additional_kwargs["session_route"] = _require_session(owner)
+
+            if "backend_factory" in ignored and owner is not None:
+                additional_kwargs["backend_factory"] = lambda: {
+                    "factory": owner.borrow_backend,
+                    "frequency": frequency,
+                    "backend_name": "session",
+                }
+            elif "backend_factory" in ignored:
 
                 def server_options(_command=command, _gnw=gnw):
                     backend_kwargs = {"host": gdb_host, "port": gdb_port} if backend == "gdb" else {}
@@ -283,21 +307,33 @@ def main(
                 additional_kwargs["backend_factory"] = server_options
 
             if "gnw" in ignored:
-                if gnw is None:
+                if gnw is None and owner is not None:
+                    gnw = owner.gnw(operation="debug" if command.__name__ in ("gdb", "gdbserver") else "manage")
+                    if frequency is not None:
+                        gnw.backend.set_frequency(frequency)
+                elif gnw is None:
                     backend_kwargs = {"host": gdb_host, "port": gdb_port} if backend == "gdb" else {}
                     gnw = GnW(OCDBackend[backend](**backend_kwargs))
                     gnw.backend.open()
                     if frequency is not None:
                         gnw.backend.set_frequency(frequency)
+                if owner is not None:
+                    # External GDB closes our RSP client while preserving the owner.
+                    # A later command in the same invocation must reopen that proxy.
+                    owner.backend()
                 additional_kwargs["gnw"] = gnw
 
             command(*bound.args, **bound.kwargs, **additional_kwargs)
     except DebugProbeConnectionError as e:
+        if owner is not None:
+            owner.failed = True
         rich.print(f"[red]Error communicating with device ({e}). Is it ON and connected?[/red]")
         close_on_exit = False
         if exit_on_error:
             sys.exit(1)
     except DataError as e:
+        if owner is not None:
+            owner.failed = True
         first_arg = e.args[0] if e.args and isinstance(e.args[0], str) else ""
         if e.args == ("BAD_FLASH_COMM",):
             rich.print("[red]Failed to communicate with external flash chip. Check your soldering![/red]")
@@ -326,10 +362,24 @@ def main(
         if exit_on_error:
             sys.exit(1)
     except ConnectionResetError:
+        if owner is not None:
+            owner.failed = True
         print(traceback.format_exc())
         close_on_exit = False
+    except BaseException as error:
+        if owner is not None and not (isinstance(error, SystemExit) and error.code in (None, 0)):
+            owner.failed = True
+        raise
     finally:
-        if close_on_exit and gnw is not None:
+        if owns_session:
+            # Preserve the active exception; uncertain cleanup never masquerades as success.
+            active_error = sys.exc_info()[0] is not None
+            try:
+                owner.close()
+            except BaseException:
+                if not active_error:
+                    raise
+        elif close_on_exit and gnw is not None and owner is None:
             gnw.backend.close()
 
 

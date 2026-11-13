@@ -32,7 +32,10 @@ def _message(msg: str):
     print(msg + "... ", end="", flush=True)
     try:
         yield
-    finally:
+    except BaseException:
+        print("failed!")
+        raise
+    else:
         print("complete!")
 
 
@@ -84,9 +87,12 @@ def unlock(
             gnw.write_memory(0x52002018, b"\x02")
             sleep(0.2)
 
-        gnw.reset()
-
-        print("Unlocking complete! Completely power cycle your device (remove battery & usb power).")
+        if hasattr(gnw.backend, "session_lease"):
+            gnw.backend.cold_reconnect(expected_rdp=0xAA)
+            print("Unlocking complete; cold-start RDP0 verified.")
+        else:
+            gnw.reset()
+            print("Unlocking complete! Completely power cycle your device (remove battery & usb power).")
     else:
         if backup_dir is None:
             backup_dir = Path(f"backups-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}")
@@ -153,15 +159,19 @@ def unlock(
             # Close connection in preparation for power removal
             gnw.backend.close()
 
-            print(_payload_flash_msg)
-            input('Press the "enter" key when the screen is blue: ')
-
-            gnw.backend.open()
-            gnw.backend.halt()
-
-            with _message(f'Backing up internal flash to "{internal_flash}"'):
-                internal_flash_data = device.read_internal_from_ram()
+            if hasattr(gnw.backend, "session_lease"):
+                gnw.invalidate_manager_state()
+                with _message("Waiting for blue unlock payload and verified SRAM backup"):
+                    internal_flash_data = gnw.backend.unlock_payload(device)
                 internal_flash.write_bytes(internal_flash_data)
+            else:
+                print(_payload_flash_msg)
+                input('Press the "enter" key when the screen is blue: ')
+                gnw.backend.open()
+                gnw.backend.halt()
+                with _message(f'Backing up internal flash to "{internal_flash}"'):
+                    internal_flash_data = device.read_internal_from_ram()
+                    internal_flash.write_bytes(internal_flash_data)
 
         with _message("Unlocking device"):
             gnw.backend.halt()
@@ -174,6 +184,8 @@ def unlock(
             gnw.write_memory(0x52002018, b"\x02")
             sleep(0.2)
 
+        if hasattr(gnw.backend, "session_lease"):
+            gnw.backend.cold_reconnect(expected_rdp=0xAA)
         with _message("Restoring firmware"):
             gnw.start_gnwmanager(force=True)
             gnw.flash(0, 0, external_flash_data)

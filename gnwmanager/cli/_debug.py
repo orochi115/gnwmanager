@@ -68,7 +68,7 @@ def hash(
 @debug.command
 def gdb(
     elf: Optional[Path] = None,
-    port: int = 3333,
+    port: Optional[int] = None,
     *,
     gnw: GnWType,
 ):
@@ -84,32 +84,11 @@ def gdb(
     port: int
         GDB Server Port.
     """
+    from gnwmanager.cli._gdb import launch_debugger
+
     if elf is None:
-        elf = Path("build/gnwmanager.elf")
-
-    gdb_executable = os.environ.get("GDB", "arm-none-eabi-gdb")
-
+        candidate = Path("build/gnwmanager.elf")
+        if getattr(gnw.backend, "session_lease", None) is None or candidate.exists():
+            elf = candidate
     gnw.start_gnwmanager(resume=False)
-    gnw.backend.start_gdbserver(port, logging=False, blocking=False)
-
-    cmd = [gdb_executable, str(elf), "-ex", "target extended-remote :3333"]
-    process = subprocess.Popen(
-        cmd,
-        stdin=sys.stdin,
-        stdout=sys.stdout,
-        stderr=sys.stderr,
-        preexec_fn=os.setsid,
-    )
-
-    def handle_signal(signum, frame):
-        # Forward the signal to the subprocess
-        if process.poll() is None:  # Check if process is still running
-            process.send_signal(signum)
-
-    # Set up signal handlers
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
-
-    exit_code = process.wait()
-
-    sys.exit(exit_code)
+    launch_debugger(gnw, elf=elf, port=port)
