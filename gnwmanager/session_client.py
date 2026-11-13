@@ -148,6 +148,17 @@ def validate_request(request):
 
 
 def _directory(directory=None, *, missing_ok=False):
+    if os.name == "nt":
+        from gnwmanager.windows_transport import private_windows_path
+        path = Path(directory) if directory is not None else Path(os.environ["LOCALAPPDATA"]) / "gnw-manager"
+        if not path.is_absolute():
+            _invalid("Manager directory must be absolute")
+        if not path.exists() and missing_ok:
+            return path
+        private_windows_path(path)
+        if not path.is_dir():
+            _invalid("Manager directory is not a directory")
+        return path
     if os.name != "posix" or not hasattr(os, "getuid") or not hasattr(socket, "AF_UNIX"):
         raise SessionError("UNSUPPORTED", "Current desktop sessions require POSIX Unix sockets")
     path = Path(directory) if directory is not None else Path(f"/tmp/gnw-manager-{os.getuid()}")
@@ -169,6 +180,12 @@ def _private_file(path, *, socket_file=False):
         metadata = path.lstat()
     except OSError as error:
         raise SessionError("NOT_FOUND", "Manager endpoint is unavailable") from error
+    if os.name == "nt":
+        from gnwmanager.windows_transport import private_windows_path
+        private_windows_path(path)
+        if not stat.S_ISREG(metadata.st_mode):
+            _invalid("Windows manager endpoint is not a regular private file")
+        return metadata
     kind = stat.S_ISSOCK if socket_file else stat.S_ISREG
     if not kind(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
         _invalid("Manager endpoint is not private")
@@ -321,10 +338,10 @@ class SessionClient:
             raise SessionError("NOT_OWNER", "Manager connection is closed")
         _directory(self.directory)
         metadata = _private_file(self.endpoint, socket_file=True)
-        peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        from gnwmanager.windows_transport import connect_endpoint
+        peer = None
         try:
-            peer.settimeout(self.rpc_timeout)
-            peer.connect(str(self.endpoint))
+            peer = connect_endpoint(self.endpoint, self.rpc_timeout)
             after = _private_file(self.endpoint, socket_file=True)
             if (metadata.st_dev, metadata.st_ino) != (after.st_dev, after.st_ino):
                 _invalid("Manager endpoint changed during connection")
@@ -339,7 +356,8 @@ class SessionClient:
             ):
                 _raise_session_error("STALE_SESSION", "Manager server identity does not match")
         except BaseException:
-            peer.close()
+            if peer is not None:
+                peer.close()
             self.close()
             raise
         return self
@@ -821,14 +839,14 @@ def discover_sessions(*, directory=None, timeout=1.0):
             metadata = _private_file(entry)
             if not _uuid(entry.stem) or metadata.st_size > _MAX_LINE:
                 continue
-            descriptor_fd = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            descriptor_fd = os.open(entry, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
             with os.fdopen(descriptor_fd, "rb") as stream:
                 opened = os.fstat(stream.fileno())
                 if (
                     (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
                     or not stat.S_ISREG(opened.st_mode)
-                    or opened.st_uid != os.getuid()
-                    or stat.S_IMODE(opened.st_mode) != 0o600
+                    or (os.name != "nt" and (opened.st_uid != os.getuid()
+                    or stat.S_IMODE(opened.st_mode) != 0o600))
                 ):
                     continue
                 descriptor = json.loads(stream.read(_MAX_LINE + 1))

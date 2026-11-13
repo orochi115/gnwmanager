@@ -22,6 +22,11 @@ class SessionGDBBackend(GDBBackend):
 
     def _endpoint_metadata(self):
         import os
+        if os.name == "nt":
+            from gnwmanager.session_client import _directory, _private_file
+            _directory(self.unix_socket.parent)
+            info = _private_file(self.unix_socket, socket_file=True)
+            return info.st_dev, info.st_ino
 
         directory = self.unix_socket.parent.lstat()
         if (
@@ -47,10 +52,9 @@ class SessionGDBBackend(GDBBackend):
         try:
             # Unlike standalone connect, managed admission is bounded by the
             # lease's remaining budget even when a Unix listen backlog is full.
-            self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            from gnwmanager.windows_transport import connect_endpoint
             remaining = self.session_lease.deadline - time.monotonic()
-            self._socket.settimeout(min(5.0, max(0.001, remaining)))
-            self._socket.connect(str(self.unix_socket))
+            self._socket = connect_endpoint(self.unix_socket, min(5.0, max(0.001, remaining)))
         except OSError as error:
             self.close()
             raise DebugProbeConnectionError("Could not connect to the managed GDB proxy") from error

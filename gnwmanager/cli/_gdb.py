@@ -12,6 +12,7 @@ from typing import Optional
 from gnwmanager.cli._parsers import GnWType
 from gnwmanager.cli.main import app
 from gnwmanager.elf import find_elf
+from gnwmanager.windows_transport import debugger_target
 
 
 @contextmanager
@@ -50,7 +51,7 @@ def launch_debugger(gnw, *, elf=None, port=None):
             raise ValueError("Session GDB uses its Unix proxy; --port is only supported for standalone probes")
         endpoint = backend.debugger_endpoint()
         lease.status()
-        target = f"target remote {endpoint}"
+        target = debugger_target(endpoint)
     else:
         if elf is None:
             elf = find_elf()
@@ -112,7 +113,7 @@ def gdbserver(port: Optional[int] = None, *, gnw: GnWType):
         raise ValueError("Session GDB uses its Unix proxy; --port is only supported for standalone probes")
     endpoint = backend.debugger_endpoint()
     lease.status()
-    print(f"target remote {endpoint}", flush=True)
+    print(debugger_target(endpoint), flush=True)
     stop = threading.Event()
     received = []
 
